@@ -72,37 +72,51 @@ class HandPreprocess:
         arr = np.stack([arr, arr, arr], axis=-1)
         return Image.fromarray(arr)
 
-class Masking:
+class HoughCircleMasking:
     """
-    Apply random block-wise masking to a tensor image.
-    The mask value is 0, which corresponds to the mean after normalization.
+    Apply masking by detecting circles using Hough Transform and masking a few of them.
     """
-    def __init__(self, mask_ratio_range=(0.4, 0.6)):
-        self.mask_ratio_range = mask_ratio_range
+    def __init__(self, num_circles_to_mask=3):
+        self.num_circles_to_mask = num_circles_to_mask
 
     def __call__(self, x):
-        c, h, w = x.shape
-        mask_ratio = np.random.uniform(self.mask_ratio_range[0], self.mask_ratio_range[1])
-        mask_area = h * w * mask_ratio
-        aspect_ratio = np.random.uniform(0.5, 2.0)
-        mask_h = int(np.sqrt(mask_area * aspect_ratio))
-        mask_w = int(np.sqrt(mask_area / aspect_ratio))
-        mask_h = min(h, mask_h)
-        mask_w = min(w, mask_w)
+        # Convert tensor to numpy array and scale to 0-255
+        np_img = (x.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
-        if mask_h == 0 or mask_w == 0:
-            return x
+        # Convert to grayscale for Hough Circle Transform
+        gray_img = cv2.cvtColor(np_img, cv2.COLOR_RGB2GRAY)
 
-        top = np.random.randint(0, h - mask_h + 1)
-        left = np.random.randint(0, w - mask_w + 1)
+        # Detect circles
+        circles = cv2.HoughCircles(gray_img, cv2.HOUGH_GRADIENT, 1, 20,
+                                   param1=50, param2=30, minRadius=10, maxRadius=50)
 
-        x[:, top:top + mask_h, left:left + mask_w] = 0
+        if circles is not None:
+            circles = np.uint16(np.around(circles))
+
+            # Randomly select a few circles to mask
+            num_detected_circles = circles.shape[1]
+            num_to_mask = min(self.num_circles_to_mask, num_detected_circles)
+
+            indices_to_mask = np.random.choice(num_detected_circles, num_to_mask, replace=False)
+
+            for i in indices_to_mask:
+                # Get circle parameters
+                center_x, center_y, radius = circles[0, i]
+
+                # Create a mask for the circle
+                mask = np.zeros_like(gray_img)
+                cv2.circle(mask, (center_x, center_y), radius, (255, 255, 255), -1)
+
+                # Apply the mask to the original tensor
+                mask_tensor = torch.from_numpy(mask).bool().expand_as(x)
+                x[mask_tensor] = 0
+
         return x
 
 def normalize_ds(mean=DS_MEAN, std=DS_STD):
     return transforms.Normalize([mean, mean, mean], [std, std, std])
 
-def simclr_view(img_size, mean=DS_MEAN, std=DS_STD):
+def contrastive_view(img_size, mean=DS_MEAN, std=DS_STD):
     return transforms.Compose([
         HandPreprocess(pad=25, clahe_clip=2.0, tile=8, thresh=5),
         transforms.RandomResizedCrop(img_size, scale=(0.5, 1.0)),
@@ -111,7 +125,7 @@ def simclr_view(img_size, mean=DS_MEAN, std=DS_STD):
         transforms.RandomGrayscale(p=0.2),
         transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
         transforms.ToTensor(),
-        transforms.RandomApply([Masking(mask_ratio_range=(0.4, 0.6))], p=0.5),
+        transforms.RandomApply([HoughCircleMasking(num_circles_to_mask=3)], p=0.5),
         normalize_ds(mean, std),
     ])
 
@@ -136,7 +150,7 @@ def regression_eval_transform(img_size, mean=DS_MEAN, std=DS_STD):
 
 class BoneAgeDataset(Dataset):
     def __init__(self, csv_file, root_dir, mode="contrastive", img_size=IMG_SIZE, male=None):
-        self.df = pd.read_csv(os.path.join("/app", csv_file), usecols=['id', 'boneage', 'male'])
+        self.df = pd.read_csv(csv_file, usecols=['id', 'boneage', 'male'])
         self.df['male'] = (
             self.df['male']
             .astype(str).str.strip().str.upper()
@@ -154,8 +168,8 @@ class BoneAgeDataset(Dataset):
         self.img_size = img_size
 
         if mode == "contrastive":
-            self.transform1 = simclr_view(img_size, mean=DS_MEAN, std=DS_STD)
-            self.transform2 = simclr_view(img_size, mean=DS_MEAN, std=DS_STD)
+            self.transform1 = contrastive_view(img_size, mean=DS_MEAN, std=DS_STD)
+            self.transform2 = contrastive_view(img_size, mean=DS_MEAN, std=DS_STD)
         elif mode == "regression_train":
             self.transform1 = regression_train_transform(img_size, mean=DS_MEAN, std=DS_STD)
             self.transform2 = self.transform1
@@ -171,7 +185,7 @@ class BoneAgeDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         img_name = f"{row['id']}.png"
-        img_path = os.path.join("/app", self.root_dir, img_name)
+        img_path = os.path.join(self.root_dir, img_name)
         boneage = float(row['boneage'])
         label_norm = (boneage - MU) / SIGMA
         gender = float(row['male'])
