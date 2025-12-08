@@ -116,8 +116,8 @@ class HoughCircleMasking:
 def normalize_ds(mean=DS_MEAN, std=DS_STD):
     return transforms.Normalize([mean, mean, mean], [std, std, std])
 
-def contrastive_view(img_size, mean=DS_MEAN, std=DS_STD):
-    return transforms.Compose([
+def contrastive_view(img_size, mean=DS_MEAN, std=DS_STD, use_masking=False):
+    aug_list = [
         HandPreprocess(pad=25, clahe_clip=2.0, tile=8, thresh=5),
         transforms.RandomResizedCrop(img_size, scale=(0.5, 1.0)),
         transforms.RandomHorizontalFlip(0.5),
@@ -125,9 +125,11 @@ def contrastive_view(img_size, mean=DS_MEAN, std=DS_STD):
         transforms.RandomGrayscale(p=0.2),
         transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
         transforms.ToTensor(),
-        transforms.RandomApply([HoughCircleMasking(num_circles_to_mask=3)], p=0.5),
-        normalize_ds(mean, std),
-    ])
+    ]
+    if use_masking:
+        aug_list.append(transforms.RandomApply([HoughCircleMasking(num_circles_to_mask=3)], p=0.5))
+    aug_list.append(normalize_ds(mean, std))
+    return transforms.Compose(aug_list)
 
 def regression_train_transform(img_size, mean=DS_MEAN, std=DS_STD):
     return transforms.Compose([
@@ -168,8 +170,8 @@ class BoneAgeDataset(Dataset):
         self.img_size = img_size
 
         if mode == "contrastive":
-            self.transform1 = contrastive_view(img_size, mean=DS_MEAN, std=DS_STD)
-            self.transform2 = contrastive_view(img_size, mean=DS_MEAN, std=DS_STD)
+            self.transform1 = contrastive_view(img_size, mean=DS_MEAN, std=DS_STD, use_masking=True)
+            self.transform2 = contrastive_view(img_size, mean=DS_MEAN, std=DS_STD, use_masking=False)
         elif mode == "regression_train":
             self.transform1 = regression_train_transform(img_size, mean=DS_MEAN, std=DS_STD)
             self.transform2 = self.transform1

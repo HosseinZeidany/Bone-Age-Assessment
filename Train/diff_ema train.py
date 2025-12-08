@@ -93,14 +93,25 @@ class MoCo(nn.Module):
     def _dequeue_and_enqueue(self, keys):
         batch_size = keys.shape[0]
         ptr = int(self.queue_ptr)
-        self.queue[:, ptr:ptr + batch_size] = keys.T
-        ptr = (ptr + batch_size) % self.K
+
+        #
+        if ptr + batch_size > self.K:
+            #
+            part1_size = self.K - ptr
+            part2_size = batch_size - part1_size
+            self.queue[:, ptr:] = keys[:part1_size].T
+            self.queue[:, :part2_size] = keys[part1_size:].T
+            ptr = part2_size
+        else:
+            self.queue[:, ptr:ptr + batch_size] = keys.T
+            ptr = (ptr + batch_size) % self.K
+
         self.queue_ptr[0] = ptr
 
-    def forward(self, im_q, im_k):
+    def forward(self, im_q, im_k, is_eval=False):
         q = self.encoder_q(im_q)
+
         with torch.no_grad():
-            self._momentum_update_key_encoder()
             k = self.encoder_k(im_k)
 
         l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
@@ -108,7 +119,11 @@ class MoCo(nn.Module):
         logits = torch.cat([l_pos, l_neg], dim=1)
         logits /= self.T
         labels = torch.zeros(logits.shape[0], dtype=torch.long).to(logits.device)
-        self._dequeue_and_enqueue(k)
+
+        if not is_eval:
+            self._dequeue_and_enqueue(k)
+            self._momentum_update_key_encoder()
+
         return F.cross_entropy(logits, labels)
 
 
@@ -119,17 +134,17 @@ def eval_contrastive(model, val_loader, device):
     for batch in val_loader:
         x1 = batch['images'].to(device, non_blocking=True)
         x2 = batch['images2'].to(device, non_blocking=True)
-        loss = model(x1, x2)
+        loss = model(x1, x2, is_eval=True)
         total += loss.item()
         n += 1
     return total / max(n, 1)
 
 def train_contrastive(model, optimizer, train_loader, val_loader, device,
-                      epochs=50, patience=15, ckpt='best_contrastive.pt',
+                      epochs=50, ckpt='best_contrastive.pt',
                       writer: SummaryWriter=None, scheduler=None):
 
-    stopper = EarlyStopping(patience=patience, mode='min', checkpoint_path=ckpt)
     global_step = 0
+    best_val_loss = float('inf')
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -166,16 +181,16 @@ def train_contrastive(model, optimizer, train_loader, val_loader, device,
         val_loss = eval_contrastive(model, val_loader, device)
         tqdm.write(f"Contrastive - Ep:{epoch} | Val Loss: {val_loss:.4f}")
 
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), ckpt)
+            tqdm.write(f"[Checkpoint] New best val loss: {best_val_loss:.4f}. Saved to {ckpt}")
+
         if writer is not None:
             writer.add_scalar("epoch/train_contrastive_loss", train_loss, epoch)
             writer.add_scalar("epoch/val_contrastive_loss", val_loss, epoch)
             for i, pg in enumerate(optimizer.param_groups):
                 writer.add_scalar(f"lr/group_{i}", pg.get('lr', 0.0), epoch)
-
-        stopper(val_loss, model)
-        if stopper.should_stop:
-            tqdm.write("[EarlyStopping] Stopping contrastive training.")
-            break
 
         if scheduler is not None:
             scheduler.step()
@@ -400,13 +415,13 @@ if __name__ == '__main__':
     contrastive_model = MoCo().to(device)
 
     if USE_CONTRASTIVE_TRAIN:
-        opt_c = torch.optim.AdamW(contrastive_model.parameters(), lr=1e-3, weight_decay=5e-4)
+        opt_c = torch.optim.SGD(contrastive_model.parameters(), lr=1e-3, momentum=0.9, weight_decay=5e-4)
         sch_c = torch.optim.lr_scheduler.CosineAnnealingLR(opt_c, T_max=50)
 
         contrastive_model = train_contrastive(
             contrastive_model, opt_c,
             train_contrastive_loader, val_contrastive_loader, device,
-            epochs=50, patience=15, ckpt=CONTRASTIVE_CKPT,
+            epochs=50, ckpt=CONTRASTIVE_CKPT,
             scheduler=sch_c, writer=tb_contrastive
         )
     else:
