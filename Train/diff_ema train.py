@@ -111,7 +111,11 @@ class MoCo(nn.Module):
     def forward(self, im_q, im_k, is_eval=False):
         q = self.encoder_q(im_q)
 
+        if not is_eval:
+            self._momentum_update_key_encoder()
+
         with torch.no_grad():
+            self.encoder_k.eval()
             k = self.encoder_k(im_k)
 
         l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
@@ -122,7 +126,6 @@ class MoCo(nn.Module):
 
         if not is_eval:
             self._dequeue_and_enqueue(k)
-            self._momentum_update_key_encoder()
 
         return F.cross_entropy(logits, labels)
 
@@ -173,6 +176,12 @@ def train_contrastive(model, optimizer, train_loader, val_loader, device,
             if writer is not None:
                 writer.add_scalar("train/batch_contrastive_loss", loss_val, global_step)
             global_step += 1
+
+        # Log queue standard deviation
+        queue_std = model.queue.std(dim=1).mean().item()
+        tqdm.write(f"Queue STD: {queue_std:.4f}")
+        if writer is not None:
+            writer.add_scalar("monitoring/queue_std", queue_std, epoch)
 
         progress.close()
         train_loss = float(np.mean(train_loss_hist))
