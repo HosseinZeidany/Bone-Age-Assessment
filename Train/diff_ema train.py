@@ -68,7 +68,7 @@ class Encoder(nn.Module):
 # ================= MoCo =================
 class MoCo(nn.Module):
     def __init__(self, dim=128, K=65536, m=0.999, T=0.07):
-        super(MoCo, self).__init__()
+        super().__init__()
         self.K = K
         self.m = m
         self.T = T
@@ -76,135 +76,199 @@ class MoCo(nn.Module):
         self.encoder_q = Encoder(proj_dim=dim)
         self.encoder_k = Encoder(proj_dim=dim)
 
-        for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
-            param_k.data.copy_(param_q.data)
-            param_k.requires_grad = False
+        # init key encoder
+        for p_q, p_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
+            p_k.data.copy_(p_q.data)
+            p_k.requires_grad = False
 
+        # queue
         self.register_buffer("queue", torch.randn(dim, K))
         self.queue = F.normalize(self.queue, dim=0)
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
 
+    # ---------------------------------------------------
+    # MOMENTUM UPDATE (q → k)
+    # ---------------------------------------------------
     @torch.no_grad()
     def _momentum_update_key_encoder(self):
-        for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
-            param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
+        for p_q, p_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
+            p_k.data.mul_(self.m).add_(p_q.data, alpha=1 - self.m)
 
+    # ---------------------------------------------------
+    # ENQUEUE WITH WRAP AROUND (official behavior)
+    # ---------------------------------------------------
     @torch.no_grad()
-    def _dequeue_and_enqueue(self, keys):
-        batch_size = keys.shape[0]
+    def _enqueue(self, keys):
+        keys = keys.detach()
+        B = keys.shape[0]
         ptr = int(self.queue_ptr)
 
-        #
-        if ptr + batch_size > self.K:
-            #
-            part1_size = self.K - ptr
-            part2_size = batch_size - part1_size
-            self.queue[:, ptr:] = keys[:part1_size].T
-            self.queue[:, :part2_size] = keys[part1_size:].T
-            ptr = part2_size
+        if ptr + B <= self.K:
+            self.queue[:, ptr:ptr + B] = keys.T
         else:
-            self.queue[:, ptr:ptr + batch_size] = keys.T
-            ptr = (ptr + batch_size) % self.K
+            first = self.K - ptr
+            self.queue[:, ptr:] = keys[:first].T
+            self.queue[:, :B - first] = keys[first:].T
 
-        self.queue_ptr[0] = ptr
+        self.queue_ptr[0] = (ptr + B) % self.K
 
-    def forward(self, im_q, im_k, is_eval=False):
+    # ---------------------------------------------------
+    # QUEUE MONITOR
+    # ---------------------------------------------------
+    @torch.no_grad()
+    def monitor_queue(self, sample_size=2048):
+        q = self.queue.detach()
+        norms = q.norm(dim=0)
+
+        # sample for duplicate detection
+        K = q.shape[1]
+        if K > sample_size:
+            idx = torch.randint(0, K, (sample_size,), device=q.device)
+            samp = q[:, idx].T
+        else:
+            samp = q.T
+
+        sims = samp @ samp.T
+        sims.fill_diagonal_(0)
+        dup_pct = (sims > 0.999).float().mean().item() * 100
+
+        return {
+            "ptr": int(self.queue_ptr),
+            "mean_norm": norms.mean().item(),
+            "std_norm": norms.std().item(),
+            "duplicates_pct": dup_pct
+        }
+
+    # ---------------------------------------------------
+    # FORWARD (official order)
+    # ---------------------------------------------------
+    def forward(self, im_q, im_k, update=True):
+        """
+        update = True  → training (enqueue + momentum update)
+        update = False → validation (NO enqueue, NO momentum)
+        """
+
+        # ----------- 1) Compute q -----------
         q = self.encoder_q(im_q)
+        q = F.normalize(q, dim=1)
 
-        if not is_eval:
+        # ----------- 2) Momentum update key encoder -----------
+        if update:
             self._momentum_update_key_encoder()
 
+        # ----------- 3) Compute k using updated encoder_k -----------
         with torch.no_grad():
-            self.encoder_k.eval()
             k = self.encoder_k(im_k)
+            k = F.normalize(k, dim=1)
 
-        l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
-        l_neg = torch.einsum('nc,ck->nk', [q, self.queue.clone().detach()])
-        logits = torch.cat([l_pos, l_neg], dim=1)
-        logits /= self.T
-        labels = torch.zeros(logits.shape[0], dtype=torch.long).to(logits.device)
+        # ----------- 4) Compute logits -----------
+        queue = self.queue.detach()
+        l_pos = torch.einsum("nc,nc->n", q, k).unsqueeze(-1)
+        l_neg = torch.einsum("nc,ck->nk", q, queue)
+        logits = torch.cat([l_pos, l_neg], dim=1) / self.T
 
-        if not is_eval:
-            self._dequeue_and_enqueue(k)
+        labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
+        loss = F.cross_entropy(logits, labels)
 
-        return F.cross_entropy(logits, labels)
+        # ----------- 5) Enqueue (only train) -----------
+        if update:
+            self._enqueue(k)
 
+        return loss
 
-@torch.no_grad()
-def eval_contrastive(model, val_loader, device):
-    model.eval()
-    total, n = 0.0, 0
-    for batch in val_loader:
-        x1 = batch['images'].to(device, non_blocking=True)
-        x2 = batch['images2'].to(device, non_blocking=True)
-        loss = model(x1, x2, is_eval=True)
-        total += loss.item()
-        n += 1
-    return total / max(n, 1)
+def train_contrastive(
+    model, optimizer, train_loader, val_loader, device,
+    epochs=200, ckpt='best_contrastive.pt',
+    writer=None, scheduler=None
+):
 
-def train_contrastive(model, optimizer, train_loader, val_loader, device,
-                      epochs=50, ckpt='best_contrastive.pt',
-                      writer: SummaryWriter=None, scheduler=None):
-
+    best_val = float('inf')
     global_step = 0
-    best_val_loss = float('inf')
 
     for epoch in range(1, epochs + 1):
+        # -------------------------
+        # TRAIN
+        # -------------------------
         model.train()
-        train_loss_hist = []
-        progress = tqdm(total=len(train_loader), desc=f"Contrastive Epoch {epoch}", ncols=110)
+        train_losses = []
+        progress = tqdm(total=len(train_loader), desc=f"E{epoch} Train", ncols=120)
 
         for it, batch in enumerate(train_loader):
             x1 = batch['images'].to(device, non_blocking=True)
             x2 = batch['images2'].to(device, non_blocking=True)
 
-            loss = model(x1, x2)
+            loss = model(x1, x2, update=True)   # <-- queue update
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            loss_val = float(loss.detach().item())
-            train_loss_hist.append(loss_val)
+            train_losses.append(loss.item())
 
             progress.set_description(
-                desc=f"Contrastive - Ep:{epoch:03d} | It:{it:04d} | Loss:{np.mean(train_loss_hist):.4f}"
+                f"Train E{epoch:03d} | L={np.mean(train_losses):.4f}"
             )
             progress.update(1)
 
-            if writer is not None:
-                writer.add_scalar("train/batch_contrastive_loss", loss_val, global_step)
+            if writer:
+                writer.add_scalar("train/batch_loss", loss.item(), global_step)
             global_step += 1
 
-        # Log queue standard deviation
-        queue_std = model.queue.std(dim=1).mean().item()
-        tqdm.write(f"Queue STD: {queue_std:.4f}")
-        if writer is not None:
-            writer.add_scalar("monitoring/queue_std", queue_std, epoch)
-
         progress.close()
-        train_loss = float(np.mean(train_loss_hist))
-        tqdm.write(f"Contrastive - Ep:{epoch} | Train Loss: {train_loss:.4f}")
 
-        val_loss = eval_contrastive(model, val_loader, device)
-        tqdm.write(f"Contrastive - Ep:{epoch} | Val Loss: {val_loss:.4f}")
+        # -------------------------
+        # QUEUE MONITORING
+        # -------------------------
+        stats = model.monitor_queue()
+        print(
+            f"Queue ptr:{stats['ptr']} | mean_norm:{stats['mean_norm']:.4f} "
+            f"| std_norm:{stats['std_norm']:.4f} | dup%:{stats['duplicates_pct']:.3f}"
+        )
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if writer:
+            writer.add_scalar("queue/mean_norm", stats['mean_norm'], epoch)
+            writer.add_scalar("queue/std_norm", stats['std_norm'], epoch)
+            writer.add_scalar("queue/duplicates_pct", stats['duplicates_pct'], epoch)
+
+        train_loss = float(np.mean(train_losses))
+        print(f"[Train] Epoch {epoch} Loss: {train_loss:.4f}")
+
+        # -------------------------
+        # VALIDATION (no queue update)
+        # -------------------------
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for batch in val_loader:
+                x1 = batch['images'].to(device, non_blocking=True)
+                x2 = batch['images2'].to(device, non_blocking=True)
+                loss = model(x1, x2, update=False)   # <-- NO queue update
+                val_losses.append(loss.item())
+
+        val_loss = float(np.mean(val_losses))
+        print(f"[Val] Epoch {epoch} Loss: {val_loss:.4f}")
+
+        # checkpoint
+        if val_loss < best_val:
+            best_val = val_loss
             torch.save(model.state_dict(), ckpt)
-            tqdm.write(f"[Checkpoint] New best val loss: {best_val_loss:.4f}. Saved to {ckpt}")
+            print(f"[Checkpoint] Saved best model (val={best_val:.4f})")
 
-        if writer is not None:
-            writer.add_scalar("epoch/train_contrastive_loss", train_loss, epoch)
-            writer.add_scalar("epoch/val_contrastive_loss", val_loss, epoch)
-            for i, pg in enumerate(optimizer.param_groups):
-                writer.add_scalar(f"lr/group_{i}", pg.get('lr', 0.0), epoch)
+        # tensorboard logging
+        if writer:
+            writer.add_scalar("epoch/train_loss", train_loss, epoch)
+            writer.add_scalar("epoch/val_loss", val_loss, epoch)
+            for gi, pg in enumerate(optimizer.param_groups):
+                writer.add_scalar(f"lr/group_{gi}", pg['lr'], epoch)
 
-        if scheduler is not None:
+        if scheduler:
             scheduler.step()
 
+    # load best
     model.load_state_dict(torch.load(ckpt, map_location=device))
+    print(f"[Done] Loaded best model (val={best_val:.4f})")
+
     return model
 
 
