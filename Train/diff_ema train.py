@@ -7,7 +7,7 @@ import numpy as np
 from tqdm import tqdm
 from torchvision import models
 from torch.utils.tensorboard import SummaryWriter
-from Cdataset import generate_dataset, SIGMA
+from Preprocess.Cdataset import generate_dataset, SIGMA
 
 # ================= EarlyStopping =================
 class EarlyStopping:
@@ -37,17 +37,12 @@ class EarlyStopping:
                 self.should_stop = True
 
 
-# ================= Contrastive (ResNet-34) =================
-class ContrastiveModel(nn.Module):
-    """
-    ResNet-34 encoder for SimCLR-style pretraining.
-    - forward_features(x) -> [B,512] pooled features
-    - forward_projection(x) -> L2-normalized projection z (for NT-Xent)
-    """
+# ================= Encoder (ResNet-34) =================
+class Encoder(nn.Module):
     def __init__(self, proj_dim=128, hidden_dim=1024):
         super().__init__()
         backbone = models.resnet34(weights=models.ResNet34_Weights.DEFAULT)
-        self.backbone = nn.Sequential(*list(backbone.children())[:-2])  # [B,512,H,W]
+        self.backbone = nn.Sequential(*list(backbone.children())[:-2])
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.out_dim = 512
 
@@ -62,104 +57,218 @@ class ContrastiveModel(nn.Module):
     def forward_features(self, x):
         f = self.backbone(x)
         f = self.pool(f).flatten(1)
-        return f  # [B,512]
+        return f
 
-    def forward_projection(self, x):
+    def forward(self, x):
         h = self.forward_features(x)
         z = self.projector(h)
         return F.normalize(z, p=2, dim=1)
 
 
-def nt_xent_loss(z1, z2, temperature=0.5):
-    B = z1.size(0)
-    z = torch.cat([z1, z2], dim=0)             # [2B, D]
-    sim = torch.matmul(z, z.t())               # [2B, 2B]
-    mask = torch.eye(2 * B, dtype=torch.bool, device=z.device)
-    sim.masked_fill_(mask, -9e15)
-    pos = torch.cat([torch.arange(B, 2 * B), torch.arange(0, B)], dim=0).to(z.device)
-    logits = sim / temperature
-    logits = logits - logits.max(dim=1, keepdim=True).values  # numerical stability
-    return F.cross_entropy(logits, pos)
+# ================= MoCo =================
+class MoCo(nn.Module):
+    def __init__(self, dim=128, K=65536, m=0.999, T=0.07):
+        super().__init__()
+        self.K = K
+        self.m = m
+        self.T = T
 
+        self.encoder_q = Encoder(proj_dim=dim)
+        self.encoder_k = Encoder(proj_dim=dim)
 
-@torch.no_grad()
-def eval_contrastive(model, val_loader, device, temperature=0.5):
-    model.eval()
-    total, n = 0.0, 0
-    for batch in val_loader:
-        x1 = batch['images'].to(device, non_blocking=True)
-        x2 = batch['images2'].to(device, non_blocking=True)
-        z1 = model.forward_projection(x1)
-        z2 = model.forward_projection(x2)
-        total += nt_xent_loss(z1, z2, temperature).item()
-        n += 1
-    return total / max(n, 1)
+        # init key encoder
+        for p_q, p_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
+            p_k.data.copy_(p_q.data)
+            p_k.requires_grad = False
 
-def train_contrastive(model, optimizer, train_loader, val_loader, device,
-                      epochs=50, temperature=0.5, patience=15, ckpt='best_contrastive.pt',
-                      writer: SummaryWriter=None, scheduler=None):
+        # queue
+        self.register_buffer("queue", torch.randn(dim, K))
+        self.queue = F.normalize(self.queue, dim=0)
+        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
 
-    stopper = EarlyStopping(patience=patience, mode='min', checkpoint_path=ckpt)
+    # ---------------------------------------------------
+    # MOMENTUM UPDATE (q → k)
+    # ---------------------------------------------------
+    @torch.no_grad()
+    def _momentum_update_key_encoder(self):
+        for p_q, p_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
+            p_k.data.mul_(self.m).add_(p_q.data, alpha=1 - self.m)
+
+    # ---------------------------------------------------
+    # ENQUEUE WITH WRAP AROUND (official behavior)
+    # ---------------------------------------------------
+    @torch.no_grad()
+    def _enqueue(self, keys):
+        keys = keys.detach()
+        B = keys.shape[0]
+        ptr = int(self.queue_ptr)
+
+        if ptr + B <= self.K:
+            self.queue[:, ptr:ptr + B] = keys.T
+        else:
+            first = self.K - ptr
+            self.queue[:, ptr:] = keys[:first].T
+            self.queue[:, :B - first] = keys[first:].T
+
+        self.queue_ptr[0] = (ptr + B) % self.K
+
+    # ---------------------------------------------------
+    # QUEUE MONITOR
+    # ---------------------------------------------------
+    @torch.no_grad()
+    def monitor_queue(self, sample_size=2048):
+        q = self.queue.detach()
+        norms = q.norm(dim=0)
+
+        # sample for duplicate detection
+        K = q.shape[1]
+        if K > sample_size:
+            idx = torch.randint(0, K, (sample_size,), device=q.device)
+            samp = q[:, idx].T
+        else:
+            samp = q.T
+
+        sims = samp @ samp.T
+        sims.fill_diagonal_(0)
+        dup_pct = (sims > 0.999).float().mean().item() * 100
+
+        return {
+            "ptr": int(self.queue_ptr),
+            "mean_norm": norms.mean().item(),
+            "std_norm": norms.std().item(),
+            "duplicates_pct": dup_pct
+        }
+
+    # ---------------------------------------------------
+    # FORWARD (official order)
+    # ---------------------------------------------------
+    def forward(self, im_q, im_k, update=True):
+        """
+        update = True  → training (enqueue + momentum update)
+        update = False → validation (NO enqueue, NO momentum)
+        """
+
+        # ----------- 1) Compute q -----------
+        q = self.encoder_q(im_q)
+        q = F.normalize(q, dim=1)
+
+        # ----------- 2) Momentum update key encoder -----------
+        if update:
+            self._momentum_update_key_encoder()
+
+        # ----------- 3) Compute k using updated encoder_k -----------
+        with torch.no_grad():
+            k = self.encoder_k(im_k)
+            k = F.normalize(k, dim=1)
+
+        # ----------- 4) Compute logits -----------
+        queue = self.queue.detach()
+        l_pos = torch.einsum("nc,nc->n", q, k).unsqueeze(-1)
+        l_neg = torch.einsum("nc,ck->nk", q, queue)
+        logits = torch.cat([l_pos, l_neg], dim=1) / self.T
+
+        labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
+        loss = F.cross_entropy(logits, labels)
+
+        # ----------- 5) Enqueue (only train) -----------
+        if update:
+            self._enqueue(k)
+
+        return loss
+
+def train_contrastive(
+    model, optimizer, train_loader, val_loader, device,
+    epochs=200, ckpt='best_contrastive.pt',
+    writer=None, scheduler=None
+):
+
+    best_val = float('inf')
     global_step = 0
 
     for epoch in range(1, epochs + 1):
+        # -------------------------
+        # TRAIN
+        # -------------------------
         model.train()
-        train_loss_hist = []
-        progress = tqdm(total=len(train_loader), desc=f"Contrastive Epoch {epoch}", ncols=110)
+        train_losses = []
+        progress = tqdm(total=len(train_loader), desc=f"E{epoch} Train", ncols=120)
 
         for it, batch in enumerate(train_loader):
             x1 = batch['images'].to(device, non_blocking=True)
             x2 = batch['images2'].to(device, non_blocking=True)
 
-            # Forward pass + loss
-            z1 = model.forward_projection(x1)
-            z2 = model.forward_projection(x2)
-            loss = nt_xent_loss(z1, z2, temperature)
+            loss = model(x1, x2, update=True)   # <-- queue update
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            # Log current batch
-            loss_val = float(loss.detach().item())
-            train_loss_hist.append(loss_val)
+            train_losses.append(loss.item())
 
             progress.set_description(
-                desc=f"Contrastive - Ep:{epoch:03d} | It:{it:04d} | Loss:{np.mean(train_loss_hist):.4f}"
+                f"Train E{epoch:03d} | L={np.mean(train_losses):.4f}"
             )
             progress.update(1)
 
-            if writer is not None:
-                writer.add_scalar("train/batch_contrastive_loss", loss_val, global_step)
+            if writer:
+                writer.add_scalar("train/batch_loss", loss.item(), global_step)
             global_step += 1
 
         progress.close()
-        train_loss = float(np.mean(train_loss_hist))
-        tqdm.write(f"Contrastive - Ep:{epoch} | Train Loss: {train_loss:.4f}")
 
-        # ---- Validation ----
-        val_loss = eval_contrastive(model, val_loader, device, temperature)
-        tqdm.write(f"Contrastive - Ep:{epoch} | Val Loss: {val_loss:.4f}")
+        # -------------------------
+        # QUEUE MONITORING
+        # -------------------------
+        stats = model.monitor_queue()
+        print(
+            f"Queue ptr:{stats['ptr']} | mean_norm:{stats['mean_norm']:.4f} "
+            f"| std_norm:{stats['std_norm']:.4f} | dup%:{stats['duplicates_pct']:.3f}"
+        )
 
-        # ---- TensorBoard Epoch Logs ----
-        if writer is not None:
-            writer.add_scalar("epoch/train_contrastive_loss", train_loss, epoch)
-            writer.add_scalar("epoch/val_contrastive_loss", val_loss, epoch)
-            for i, pg in enumerate(optimizer.param_groups):
-                writer.add_scalar(f"lr/group_{i}", pg.get('lr', 0.0), epoch)
+        if writer:
+            writer.add_scalar("queue/mean_norm", stats['mean_norm'], epoch)
+            writer.add_scalar("queue/std_norm", stats['std_norm'], epoch)
+            writer.add_scalar("queue/duplicates_pct", stats['duplicates_pct'], epoch)
 
-        # ---- Early Stopping ----
-        stopper(val_loss, model)
-        if stopper.should_stop:
-            tqdm.write("[EarlyStopping] Stopping contrastive training.")
-            break
+        train_loss = float(np.mean(train_losses))
+        print(f"[Train] Epoch {epoch} Loss: {train_loss:.4f}")
 
-        if scheduler is not None:
+        # -------------------------
+        # VALIDATION (no queue update)
+        # -------------------------
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for batch in val_loader:
+                x1 = batch['images'].to(device, non_blocking=True)
+                x2 = batch['images2'].to(device, non_blocking=True)
+                loss = model(x1, x2, update=False)   # <-- NO queue update
+                val_losses.append(loss.item())
+
+        val_loss = float(np.mean(val_losses))
+        print(f"[Val] Epoch {epoch} Loss: {val_loss:.4f}")
+
+        # checkpoint
+        if val_loss < best_val:
+            best_val = val_loss
+            torch.save(model.state_dict(), ckpt)
+            print(f"[Checkpoint] Saved best model (val={best_val:.4f})")
+
+        # tensorboard logging
+        if writer:
+            writer.add_scalar("epoch/train_loss", train_loss, epoch)
+            writer.add_scalar("epoch/val_loss", val_loss, epoch)
+            for gi, pg in enumerate(optimizer.param_groups):
+                writer.add_scalar(f"lr/group_{gi}", pg['lr'], epoch)
+
+        if scheduler:
             scheduler.step()
 
-    # Load best checkpoint
+    # load best
     model.load_state_dict(torch.load(ckpt, map_location=device))
+    print(f"[Done] Loaded best model (val={best_val:.4f})")
+
     return model
 
 
@@ -169,9 +278,9 @@ class BoneAgePredictionModel(nn.Module):
     def __init__(self, contrastive_model, num_classes=1):
         super().__init__()
         self.contrastive_model = contrastive_model
-        self.pre_head_norm = nn.LayerNorm(512, eps=1e-6)   # small stabilizer
+        self.pre_head_norm = nn.LayerNorm(512, eps=1e-6)
 
-        in_dim = 512 + 1  # encoder (512) + gender(1)
+        in_dim = 512 + 1
         self.regression_head = nn.Sequential(
             nn.Linear(in_dim, 512),
             nn.ReLU(inplace=True),
@@ -188,47 +297,34 @@ class BoneAgePredictionModel(nn.Module):
             nn.Linear(128, 64),
             nn.ReLU(inplace=True),
 
-            nn.Linear(64, num_classes)  # -> normalized scalar
+            nn.Linear(64, num_classes)
         )
 
     def forward(self, x, gender):
-        h = self.contrastive_model.forward_features(x)  # [B,512]
+        h = self.contrastive_model.forward_features(x)
         h = self.pre_head_norm(h)
         g = gender.view(-1, 1).float()
-        xcat = torch.cat([h, g], dim=1)                # [B,513]
-        return self.regression_head(xcat)              # [B,1]
+        xcat = torch.cat([h, g], dim=1)
+        return self.regression_head(xcat)
 
 
 # ================= Eval: true item-wise MAE (months) =================
 @torch.no_grad()
 def eval_regression(model, val_loader, device, tta: bool = False):
-    """
-    Evaluate MAE in months.
-    If tta=True, use simple test-time augmentation:
-      - predict on original image
-      - predict on horizontally flipped image
-      - average the two predictions
-    """
     model.eval()
     total_abs_norm, n_items = 0.0, 0
 
     for batch in val_loader:
-        x = batch['images'].to(device, non_blocking=True)   # [B,3,H,W]
-        y = batch['labels'].to(device, non_blocking=True)   # normalized
+        x = batch['images'].to(device, non_blocking=True)
+        y = batch['labels'].to(device, non_blocking=True)
         g = batch['gender'].to(device, non_blocking=True)
 
         if not tta:
-            # normal single-view prediction
             pred = model(x, g)
         else:
-            # 1) original prediction
             pred1 = model(x, g)
-
-            # 2) horizontally flipped prediction
-            x_flip = torch.flip(x, dims=[3])   # flip width dimension
+            x_flip = torch.flip(x, dims=[3])
             pred2 = model(x_flip, g)
-
-            # 3) average predictions
             pred = 0.5 * (pred1 + pred2)
 
         abs_err = (pred - y).abs()
@@ -245,7 +341,6 @@ def train_bone_age_model(model, optimizer, train_loader, val_loader, device,
                          epochs=50, patience=20, ckpt='best_regression.pt',
                          writer=None, scheduler=None):
 
-    # Huber beta: 3 months -> normalize by SIGMA
     BETA_MONTHS = 1.5
     BETA_NORM = BETA_MONTHS / SIGMA
 
@@ -257,7 +352,7 @@ def train_bone_age_model(model, optimizer, train_loader, val_loader, device,
     for p in model_ema.parameters():
         p.requires_grad_(False)
 
-    EMA_START_EPOCH = 5  # <--- NEW: start EMA after a few epochs
+    EMA_START_EPOCH = 5
 
     def ema_update(m_src, m_tgt, decay):
         with torch.no_grad():
@@ -274,7 +369,6 @@ def train_bone_age_model(model, optimizer, train_loader, val_loader, device,
         train_mae_months_hist = []
         progress = tqdm(total=len(train_loader), desc=f"Train Epoch {epoch}", ncols=110)
 
-        # epoch-dependent decay (next change)
         if epoch < 20:
             ema_decay = 0.99
         elif epoch < 40:
@@ -296,7 +390,6 @@ def train_bone_age_model(model, optimizer, train_loader, val_loader, device,
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            # ✅ EMA only after warmup, with adaptive decay
             if epoch >= EMA_START_EPOCH:
                 ema_update(model, model_ema, decay=ema_decay)
 
@@ -318,8 +411,6 @@ def train_bone_age_model(model, optimizer, train_loader, val_loader, device,
         train_mae_months = float(np.mean(train_mae_months_hist))
         tqdm.write(f"Train - Ep:{epoch} | MAE (months): {train_mae_months:.2f}")
 
-        # ---- Validation using EMA model ----
-        # ---- VALIDATION (RAW + EMA, both with and without TTA) ----
         val_raw_no_tta = eval_regression(model, val_loader, device, tta=False)
         val_raw_tta = eval_regression(model, val_loader, device, tta=True)
 
@@ -332,14 +423,12 @@ def train_bone_age_model(model, optimizer, train_loader, val_loader, device,
             f"EMA(noTTA): {val_ema_no_tta:.2f}  | EMA(TTA): {val_ema_tta:.2f}"
         )
 
-        # ---- Log epoch metrics ----
         if writer is not None:
             writer.add_scalar("val/raw_no_tta", val_raw_no_tta, epoch)
             writer.add_scalar("val/raw_tta", val_raw_tta, epoch)
             writer.add_scalar("val/ema_no_tta", val_ema_no_tta, epoch)
             writer.add_scalar("val/ema_tta", val_ema_tta, epoch)
 
-        # ---- Early stopping ----
         stopper(val_ema_tta, model_ema)
 
         if stopper.should_stop:
@@ -349,7 +438,6 @@ def train_bone_age_model(model, optimizer, train_loader, val_loader, device,
         if scheduler is not None:
             scheduler.step()
 
-    # ---- Save best EMA weights ----
     torch.save(model_ema.state_dict(), ckpt)
     model.load_state_dict(torch.load(ckpt, map_location=device))
     return model
@@ -357,10 +445,7 @@ def train_bone_age_model(model, optimizer, train_loader, val_loader, device,
 
 # ================= Contrastive loader (optional) =================
 def load_contrastive_from_ckpt(ckpt_path, device):
-    """
-    Loads a ResNet-34 ContrastiveModel from ckpt if compatible; otherwise keeps ImageNet init.
-    """
-    model = ContrastiveModel(proj_dim=128, hidden_dim=1024).to(device)
+    model = MoCo().to(device)
     if ckpt_path is None:
         print("[Info] No contrastive checkpoint provided. Using ImageNet-initialized encoder.")
         return model
@@ -383,7 +468,6 @@ if __name__ == '__main__':
     if torch.cuda.is_available():
         print("[CUDA] name:", torch.cuda.get_device_name(0))
 
-    # build datasets/loaders (from your Cdataset.py)
     (
         train_contrastive_ds,
         val_contrastive_ds,
@@ -393,30 +477,27 @@ if __name__ == '__main__':
         val_contrastive_loader,
         train_regression_loader,
         val_regression_loader
-    ) = generate_dataset(male=None)  # or True / False to filter
+    ) = generate_dataset(male=None)
 
     tb_contrastive = SummaryWriter(log_dir="runs3/contrastive")
     tb_regression = SummaryWriter(log_dir="runs3/regression")
 
-    # ---- Contrastive encoder: either PRETRAIN now or LOAD ckpt ----
-    USE_CONTRASTIVE_TRAIN = False  # <-- set True to pretrain now
-    CONTRASTIVE_CKPT = "best_contrastive.pt"  # where to save/load
+    USE_CONTRASTIVE_TRAIN = True
+    CONTRASTIVE_CKPT = "best_contrastive.pt"
 
-    contrastive_model = ContrastiveModel(proj_dim=128, hidden_dim=1024).to(device)
+    contrastive_model = MoCo().to(device)
 
     if USE_CONTRASTIVE_TRAIN:
-        # Optim & schedule for SimCLR
-        opt_c = torch.optim.AdamW(contrastive_model.parameters(), lr=1e-3, weight_decay=5e-4)
+        opt_c = torch.optim.SGD(contrastive_model.parameters(), lr=1e-3, momentum=0.9, weight_decay=5e-4)
         sch_c = torch.optim.lr_scheduler.CosineAnnealingLR(opt_c, T_max=50)
 
         contrastive_model = train_contrastive(
             contrastive_model, opt_c,
             train_contrastive_loader, val_contrastive_loader, device,
-            epochs=50, temperature=0.5, patience=15, ckpt=CONTRASTIVE_CKPT,
+            epochs=50, ckpt=CONTRASTIVE_CKPT,
             scheduler=sch_c, writer=tb_contrastive
         )
     else:
-        # Try to load a previously trained checkpoint (strict=False to be tolerant)
         try:
             state = torch.load(CONTRASTIVE_CKPT, map_location=device)
             missing, unexpected = contrastive_model.load_state_dict(state, strict=False)
@@ -428,11 +509,9 @@ if __name__ == '__main__':
             print(f"[WARN] Could not load {CONTRASTIVE_CKPT}: {e}")
             print("[Info] Proceeding with ImageNet-initialized ResNet-34 encoder.")
 
-    # ---- Build regression model ----
-    reg_model = BoneAgePredictionModel(contrastive_model).to(device)
+    reg_model = BoneAgePredictionModel(contrastive_model.encoder_q).to(device)
     print("[Sanity] reg in_features = 512 + gender(1) =", 512 + 1)
 
-    # ---- Differential LRs: smaller for encoder, larger for head ----
     enc_params, head_params = [], []
     for n, p in reg_model.named_parameters():
         if not p.requires_grad:
@@ -450,7 +529,6 @@ if __name__ == '__main__':
 
     scheduler_r = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_r, T_max=100)
 
-    # ---- Train regression with Huber + EMA ----
     reg_model = train_bone_age_model(
         reg_model, optimizer_r, train_regression_loader, val_regression_loader, device,
         epochs=100, patience=25, ckpt='best_regression.pt',

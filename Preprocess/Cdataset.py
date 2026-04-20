@@ -44,19 +44,17 @@ class HandPreprocess:
       4) CLAHE
     """
     def __init__(self, pad=25, clahe_clip=2.0, tile=8, thresh=5):
-        self.pad = pad                 # ↑ was 12 → 25 (more margin)
+        self.pad = pad
         self.clahe_clip = clahe_clip
         self.tile = tile
-        self.thresh = thresh           # ↓ was 10 → 5 (keep faint fingertips)
+        self.thresh = thresh
 
     def __call__(self, img: Image.Image) -> Image.Image:
         arr = np.array(img.convert("L"))
 
-        # polarity: invert if background is bright
         if arr.mean() > 128:
             arr = 255 - arr
 
-        # threshold + bbox with padding
         mask = arr > self.thresh
         ys, xs = np.where(mask)
         if len(xs) > 0:
@@ -68,24 +66,58 @@ class HandPreprocess:
             y2 = min(arr.shape[0] - 1, y2 + self.pad)
             arr = arr[y1:y2 + 1, x1:x2 + 1]
 
-        # CLAHE
         clahe = cv2.createCLAHE(clipLimit=self.clahe_clip, tileGridSize=(self.tile, self.tile))
         arr = clahe.apply(arr)
 
-        # back to 3ch PIL
         arr = np.stack([arr, arr, arr], axis=-1)
         return Image.fromarray(arr)
 
+class HoughCircleMasking:
+    """
+    Apply masking by detecting circles using Hough Transform and masking a few of them.
+    """
+    def __init__(self, num_circles_to_mask=3):
+        self.num_circles_to_mask = num_circles_to_mask
+
+    def __call__(self, x):
+        # Convert tensor to numpy array and scale to 0-255
+        np_img = (x.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+        # Convert to grayscale for Hough Circle Transform
+        gray_img = cv2.cvtColor(np_img, cv2.COLOR_RGB2GRAY)
+
+        # Detect circles
+        circles = cv2.HoughCircles(gray_img, cv2.HOUGH_GRADIENT, 1, 20,
+                                   param1=50, param2=30, minRadius=10, maxRadius=50)
+
+        if circles is not None:
+            circles = np.uint16(np.around(circles))
+
+            # Randomly select a few circles to mask
+            num_detected_circles = circles.shape[1]
+            num_to_mask = min(self.num_circles_to_mask, num_detected_circles)
+
+            indices_to_mask = np.random.choice(num_detected_circles, num_to_mask, replace=False)
+
+            for i in indices_to_mask:
+                # Get circle parameters
+                center_x, center_y, radius = circles[0, i]
+
+                # Create a mask for the circle
+                mask = np.zeros_like(gray_img)
+                cv2.circle(mask, (center_x, center_y), radius, (255, 255, 255), -1)
+
+                # Apply the mask to the original tensor
+                mask_tensor = torch.from_numpy(mask).bool().expand_as(x)
+                x[mask_tensor] = 0
+
+        return x
 
 def normalize_ds(mean=DS_MEAN, std=DS_STD):
     return transforms.Normalize([mean, mean, mean], [std, std, std])
 
-
-# --------- Contrastive views (SimCLR-style, strong + stochastic) ----------
-def simclr_view(img_size, mean=DS_MEAN, std=DS_STD):
-    # k = int(0.1 * img_size)
-    # if k % 2 == 0: k += 1
-    return transforms.Compose([
+def contrastive_view(img_size, mean=DS_MEAN, std=DS_STD, use_masking=False):
+    aug_list = [
         HandPreprocess(pad=25, clahe_clip=2.0, tile=8, thresh=5),
         transforms.RandomResizedCrop(img_size, scale=(0.5, 1.0)),
         transforms.RandomHorizontalFlip(0.5),
@@ -93,23 +125,23 @@ def simclr_view(img_size, mean=DS_MEAN, std=DS_STD):
         transforms.RandomGrayscale(p=0.2),
         transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
         transforms.ToTensor(),
-        normalize_ds(mean, std),
-    ])
+    ]
+    if use_masking:
+        aug_list.append(transforms.RandomApply([HoughCircleMasking(num_circles_to_mask=3)], p=0.5))
+    aug_list.append(normalize_ds(mean, std))
+    return transforms.Compose(aug_list)
 
-# --------- Regression train (light, anatomy-safe) ----------
 def regression_train_transform(img_size, mean=DS_MEAN, std=DS_STD):
     return transforms.Compose([
         HandPreprocess(pad=25, clahe_clip=2.0, tile=8, thresh=5),
-        transforms.RandomResizedCrop(img_size, scale=(0.95, 1.0)),  # gentler crop
+        transforms.RandomResizedCrop(img_size, scale=(0.95, 1.0)),
         transforms.RandomHorizontalFlip(0.5),
         transforms.ColorJitter(brightness=0.1, contrast=0.1),
-        transforms.RandomAffine(degrees=7, translate=(0.02, 0.02), scale=(0.98, 1.02)),  # tiny affine
+        transforms.RandomAffine(degrees=7, translate=(0.02, 0.02), scale=(0.98, 1.02)),
         transforms.ToTensor(),
         normalize_ds(mean, std),
     ])
 
-
-# --------- Regression eval (deterministic) ----------
 def regression_eval_transform(img_size, mean=DS_MEAN, std=DS_STD):
     return transforms.Compose([
         HandPreprocess(pad=25, clahe_clip=2.0, tile=8, thresh=5),
@@ -118,20 +150,9 @@ def regression_eval_transform(img_size, mean=DS_MEAN, std=DS_STD):
         normalize_ds(mean, std),
     ])
 
-
-# =========================
-# Dataset
-# =========================
 class BoneAgeDataset(Dataset):
-    """
-    mode:
-      - 'contrastive'      -> returns two views: images, images2 (same image, different augs)
-      - 'regression_train' -> returns images (light augs), images2 (same as images, unused)
-      - 'regression_eval'  -> returns deterministic images (no random augs)
-    """
     def __init__(self, csv_file, root_dir, mode="contrastive", img_size=IMG_SIZE, male=None):
         self.df = pd.read_csv(csv_file, usecols=['id', 'boneage', 'male'])
-        # Normalize 'male' to 0/1 (handles TRUE/FALSE with spaces, etc.)
         self.df['male'] = (
             self.df['male']
             .astype(str).str.strip().str.upper()
@@ -140,9 +161,7 @@ class BoneAgeDataset(Dataset):
             .astype(int)
         )
 
-        # Keep the gender filter (optional: pass male=True / False / 1 / 0)
         if male is not None:
-            # accept True/False or 1/0
             target = int(male)
             self.df = self.df[self.df['male'] == target].reset_index(drop=True)
 
@@ -150,13 +169,9 @@ class BoneAgeDataset(Dataset):
         self.mode = mode
         self.img_size = img_size
 
-        # pick transforms based on mode
         if mode == "contrastive":
-            # keep your original transforms
-            self.transform1 = simclr_view(img_size, mean=DS_MEAN, std=DS_STD)
-            self.transform2 = simclr_view(img_size, mean=DS_MEAN, std=DS_STD)
-
-            # NOTE: self.pre1 and self.pre2 should both be HandPreprocess; we will run just once
+            self.transform1 = contrastive_view(img_size, mean=DS_MEAN, std=DS_STD, use_masking=True)
+            self.transform2 = contrastive_view(img_size, mean=DS_MEAN, std=DS_STD, use_masking=False)
         elif mode == "regression_train":
             self.transform1 = regression_train_transform(img_size, mean=DS_MEAN, std=DS_STD)
             self.transform2 = self.transform1
@@ -169,30 +184,21 @@ class BoneAgeDataset(Dataset):
     def __len__(self):
         return len(self.df)
 
-
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         img_name = f"{row['id']}.png"
         img_path = os.path.join(self.root_dir, img_name)
-
-        # label normalize
         boneage = float(row['boneage'])
         label_norm = (boneage - MU) / SIGMA
-
-        # gender as 0/1 float
         gender = float(row['male'])
-
-        # load + transform
-
         img = load_image(img_path)
 
         if self.mode == "contrastive":
-            # run HandPreprocess ONCE (use pre1; pre2 is the same class)
             img1 = self.transform1(img)
             img2 = self.transform2(img)
         else:
             img1 = self.transform1(img)
-            img2 = img1  # regression: second view unused
+            img2 = img1
 
         sample = {
             'images': img1,
@@ -205,33 +211,20 @@ class BoneAgeDataset(Dataset):
 def load_image(path):
     return Image.open(path).convert('RGB')
 
-
-# =========================
-# Loader factory
-# =========================
 def generate_dataset(male=None,
                      img_size=IMG_SIZE,
                      batch_contrastive=BATCH_CONTRASTIVE,
                      batch_regression=BATCH_REGRESSION,
                      workers=WORKERS):
-    """
-    Returns:
-      train_contrastive_ds, val_contrastive_ds, train_regression_ds, val_regression_ds,
-      train_contrastive_loader, val_contrastive_loader,
-      train_regression_loader,  val_regression_loader
-    """
-    # datasets
     train_contrastive_ds = BoneAgeDataset('train.csv', 'trainimages', mode='contrastive',
                                           img_size=img_size, male=male)
     val_contrastive_ds   = BoneAgeDataset('val.csv', 'valimages',     mode='contrastive',
                                           img_size=img_size, male=male)
-
     train_regression_ds  = BoneAgeDataset('train.csv', 'trainimages', mode='regression_train',
                                           img_size=img_size, male=male)
     val_regression_ds    = BoneAgeDataset('val.csv', 'valimages',     mode='regression_eval',
                                           img_size=img_size, male=male)
 
-    # loaders
     train_contrastive_loader = DataLoader(
         train_contrastive_ds,
         batch_size=BATCH_CONTRASTIVE, shuffle=True, num_workers=WORKERS,
@@ -244,7 +237,6 @@ def generate_dataset(male=None,
         num_workers=workers,
         pin_memory=True, persistent_workers=True
     )
-
     train_regression_loader = DataLoader(
         train_regression_ds,
         batch_size=batch_regression,
@@ -253,7 +245,6 @@ def generate_dataset(male=None,
         pin_memory=True, persistent_workers=True,
         drop_last=True
     )
-
     val_regression_loader = DataLoader(
         val_regression_ds,
         batch_size=1,
