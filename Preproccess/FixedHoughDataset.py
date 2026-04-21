@@ -257,20 +257,20 @@ def generate_dataset(male=None,
                      batch_regression=BATCH_REGRESSION,
                      workers=WORKERS):
     train_contrastive_ds = BoneAgeDataset('train.csv', 'trainimages', mode='contrastive',
-                                          img_size=img_size)
+                                          img_size=img_size, male=male)
     val_contrastive_ds   = BoneAgeDataset('val.csv', 'valimages',     mode='contrastive',
-                                          img_size=img_size)
+                                          img_size=img_size, male=male)
     train_regression_ds  = BoneAgeDataset('train.csv', 'trainimages', mode='regression_train',
-                                          img_size=img_size)
+                                          img_size=img_size, male=male)
     val_regression_ds    = BoneAgeDataset('val.csv', 'valimages',     mode='regression_eval',
-                                          img_size=img_size)
+                                          img_size=img_size, male=male)
     # test dataset (NO augmentation)
     test_regression_ds = BoneAgeDataset(
         csv_file="test.csv",
         root_dir="testimages",
         mode="regression_eval",
-        img_size=IMG_SIZE,
-        male=None
+        img_size=img_size,
+        male=male
     )
 
     test_regression_loader = DataLoader(
