@@ -468,35 +468,6 @@ def train_bone_age_model(model, optimizer, train_loader, val_loader,test_loader,
             print("[Info] Optimizer & scheduler reset after unfreezing layer4")
 
 
-        elif epoch == 15:
-            print("[Info] Unfreezing layer3 (mid-level features)")
-
-            for p in model.contrastive_model.backbone[6].parameters():
-                p.requires_grad = True
-
-            optimizer = torch.optim.AdamW(
-                [
-                    {"params": model.contrastive_model.backbone[6].parameters(), "lr": 1e-5},
-                    {"params": model.contrastive_model.backbone[7].parameters(), "lr": 5e-5},
-                    {"params": model.pre_head_norm.parameters(), "lr": 5e-4},
-                    {"params": model.gender_embed.parameters(), "lr": 5e-4},
-                    # 🔥 NEW HEAD PARAMS
-                    {"params": model.shared.parameters(), "lr": 5e-4},
-                    {"params": model.coarse_head.parameters(), "lr": 5e-4},
-                    {"params": model.fine_head.parameters(), "lr": 5e-4},
-                ],
-                weight_decay=1e-5,
-            )
-
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=epochs - epoch,
-            )
-            model_ema = create_ema(model, device)
-
-
-            print("[Info] Optimizer & scheduler reset after unfreezing layer3")
-
         model.train()
         train_mae_months_hist = []
         progress = tqdm(total=len(train_loader), desc=f"Train Epoch {epoch}", ncols=110)
@@ -556,7 +527,7 @@ def train_bone_age_model(model, optimizer, train_loader, val_loader,test_loader,
             # =========================
             # 🔥 FINE LOSS
             # =========================
-            loss_fine = F.smooth_l1_loss(pred_age, y_months, beta=1.5)
+            loss_fine = F.smooth_l1_loss(pred_age, y_months.squeeze(1), beta=1.5)
 
             # =========================
             # 🔥 TOTAL LOSS
@@ -571,7 +542,7 @@ def train_bone_age_model(model, optimizer, train_loader, val_loader,test_loader,
                 ema_update(model, model_ema, decay=ema_decay)
 
             with torch.no_grad():
-                mae_months_batch = (pred_age - y_months).abs().mean().item()
+                mae_months_batch = (pred_age - y_months.squeeze(1)).abs().mean().item()
             train_mae_months_hist.append(mae_months_batch)
 
             progress.set_description(
